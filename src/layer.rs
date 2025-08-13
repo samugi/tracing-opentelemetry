@@ -4,6 +4,7 @@ use opentelemetry::{
     trace::{self as otel, noop, SpanBuilder, SpanKind, Status, TraceContextExt},
     Context as OtelContext, Key, KeyValue, StringValue, Value,
 };
+use serde_json::Value as SerdeValue;
 use std::fmt;
 use std::marker;
 use std::thread;
@@ -42,6 +43,7 @@ pub struct OpenTelemetryLayer<S, T> {
     with_level: bool,
     sem_conv_config: SemConvConfig,
     get_context: WithContext,
+    serialized_field_key: Option<String>,
     _registry: marker::PhantomData<S>,
 }
 
@@ -401,14 +403,65 @@ struct SemConvConfig {
 struct SpanAttributeVisitor<'a> {
     span_builder_updates: &'a mut SpanBuilderUpdates,
     sem_conv_config: SemConvConfig,
+    serialized_field_key: &'a Option<String>,
 }
 
 impl SpanAttributeVisitor<'_> {
-    fn record(&mut self, attribute: KeyValue) {
+    fn handle_json_attributes(&mut self, key: &Key, value: &Value) {
+        match serde_json::from_str(value.as_str().as_ref()) {
+            Ok(SerdeValue::Object(map)) => {
+                for (k, v) in map {
+                    let key_value = KeyValue::new(Key::from(k), self.convert_serde_value(v));
+                    self.add_attribute(key_value);
+                }
+            }
+            Ok(_) => {
+                tracing::warn!("Values not a JSON object: {}", value);
+                self.add_attribute(KeyValue::new(key.clone(), value.clone()));
+            }
+            Err(_) => {
+                tracing::warn!("Failed to parse Value as JSON: {}", value);
+                self.add_attribute(KeyValue::new(key.clone(), value.clone()));
+            }
+        }
+    }
+
+    fn convert_serde_value(&self, v: SerdeValue) -> Value {
+        match v {
+            SerdeValue::String(s) => Value::String(s.into()),
+            SerdeValue::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::I64(i)
+                } else if let Some(f) = n.as_f64() {
+                    Value::F64(f)
+                } else {
+                    Value::String(n.to_string().into())
+                }
+            }
+            SerdeValue::Bool(b) => Value::Bool(b),
+            _ => Value::String(v.to_string().into()),
+        }
+    }
+
+    fn add_attribute(&mut self, key_value: KeyValue) {
         self.span_builder_updates
             .attributes
             .get_or_insert_with(Vec::new)
-            .push(KeyValue::new(attribute.key, attribute.value));
+            .push(key_value);
+    }
+
+    fn record(&mut self, attribute: KeyValue) {
+        let KeyValue { key, value, .. } = attribute;
+
+        if self
+            .serialized_field_key
+            .as_ref()
+            .is_some_and(|ser_f_k| key.as_str() == ser_f_k)
+        {
+            self.handle_json_attributes(&key, &value);
+        } else {
+            self.add_attribute(KeyValue::new(key, value.clone()));
+        }
     }
 }
 
@@ -574,8 +627,15 @@ where
             },
 
             get_context: WithContext(Self::get_context),
+            serialized_field_key: None,
             _registry: marker::PhantomData,
         }
+    }
+
+    pub fn with_serialized_field_key(tracer: T, serialized_field_key: impl Into<String>) -> Self {
+        let mut layer = OpenTelemetryLayer::new(tracer);
+        layer.serialized_field_key = Some(serialized_field_key.into());
+        layer
     }
 
     /// Set the [`Tracer`] that this layer will use to produce and track
@@ -623,6 +683,7 @@ where
             with_level: self.with_level,
             sem_conv_config: self.sem_conv_config,
             get_context: WithContext(OpenTelemetryLayer::<S, Tracer>::get_context),
+            serialized_field_key: None,
             _registry: self._registry,
             // cannot use ``..self` here due to different generics
         }
@@ -929,6 +990,7 @@ where
         attrs.record(&mut SpanAttributeVisitor {
             span_builder_updates: &mut updates,
             sem_conv_config: self.sem_conv_config,
+            serialized_field_key: &self.serialized_field_key,
         });
 
         updates.update(&mut builder);
@@ -978,6 +1040,7 @@ where
         values.record(&mut SpanAttributeVisitor {
             span_builder_updates: &mut updates,
             sem_conv_config: self.sem_conv_config,
+            serialized_field_key: &self.serialized_field_key,
         });
         let mut extensions = span.extensions_mut();
         if let Some(data) = extensions.get_mut::<OtelData>() {
