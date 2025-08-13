@@ -4,6 +4,7 @@ use opentelemetry::{
     trace::{self as otel, noop, SpanBuilder, SpanKind, Status, TraceContextExt},
     Context as OtelContext, Key, KeyValue, StringValue, Value,
 };
+use serde_json::{Map as SerdeMap, Value as SerdeValue};
 use std::fmt;
 use std::marker;
 use std::thread;
@@ -404,11 +405,58 @@ struct SpanAttributeVisitor<'a> {
 }
 
 impl SpanAttributeVisitor<'_> {
-    fn record(&mut self, attribute: KeyValue) {
+    fn handle_json_attributes(&mut self, key: &Key, value: &Value) {
+        match serde_json::from_str(value.as_str().as_ref()) {
+            Ok(SerdeValue::Object(map)) => {
+                for (k, v) in map {
+                    let key_value = KeyValue::new(Key::from(k), self.convert_serde_value(v));
+                    self.add_attribute(key_value);
+                }
+            }
+            Ok(_) => {
+                tracing::warn!("houd_atrs is not a JSON object: {}", value);
+                self.add_attribute(KeyValue::new(key.clone(), value.clone()));
+            }
+            Err(_) => {
+                tracing::warn!("Failed to parse houd_atrs as JSON: {}", value);
+                self.add_attribute(KeyValue::new(key.clone(), value.clone()));
+            }
+        }
+    }
+
+    fn convert_serde_value(&self, v: SerdeValue) -> Value {
+        match v {
+            SerdeValue::String(s) => Value::String(s.into()),
+            SerdeValue::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::I64(i)
+                } else if let Some(f) = n.as_f64() {
+                    Value::F64(f)
+                } else {
+                    Value::String(n.to_string().into())
+                }
+            }
+            SerdeValue::Bool(b) => Value::Bool(b),
+            _ => Value::String(v.to_string().into()),
+        }
+    }
+
+    fn add_attribute(&mut self, key_value: KeyValue) {
         self.span_builder_updates
             .attributes
             .get_or_insert_with(Vec::new)
-            .push(KeyValue::new(attribute.key, attribute.value));
+            .push(key_value);
+    }
+
+    fn record(&mut self, attribute: KeyValue) {
+        let KeyValue { key, value, .. } = attribute;
+
+        // TODO: share this key
+        if key.as_str() == "houd_atrs" {
+            self.handle_json_attributes(&key, &value);
+        } else {
+            self.add_attribute(KeyValue::new(key, value.clone()));
+        }
     }
 }
 
